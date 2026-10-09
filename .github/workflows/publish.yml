@@ -56,10 +56,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        platform: [amd64, arm64]
+        platform: [arm64]
         include:
-          - platform: amd64
-            runs-on: ubuntu-24.04
           - platform: arm64
             runs-on: ubuntu-24.04-arm
 
@@ -95,6 +93,9 @@ jobs:
         shell: bash
         run: |
           BASE_CONFIG="type=sha,format=long"
+          if [[ "$GITHUB_REF" == "refs/heads/main" ]]; then
+            BASE_CONFIG+=$'\n'"type=raw,value=latest"
+          fi
           if [[ $GITHUB_EVENT_NAME == "schedule" ]]; then
             BASE_CONFIG+=$'\n'"type=schedule,pattern=nightly"
             BASE_CONFIG+=$'\n'"type=schedule,pattern=nightly-{{date 'ddd'}}"
@@ -124,7 +125,7 @@ jobs:
         uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf # v6.0.0
         with:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
-          flavor: latest=false
+          flavor: latest=auto
           tags: ${{ env.TAGS_SPEC }}
           labels: |
             org.opencontainers.image.version=${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || '' }}
@@ -211,7 +212,7 @@ jobs:
           done <<< "${TAGS}"
 
           image_args=()
-          for PLATFORM in amd64 arm64; do
+          for PLATFORM in arm64; do
             image_args+=("${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@sha256:$(<"${DIGESTS_DIR}/digest-${PLATFORM}")")
           done
 
@@ -250,6 +251,37 @@ jobs:
             sleep ${delay}
           done
 
+  deploy:
+    name: Deploy production
+    needs: [merge]
+    if: github.ref == 'refs/heads/main'
+    # Runs directly on the target host via the self-hosted runner.
+    runs-on: [self-hosted, Linux, ARM64]
+
+    steps:
+      - name: Back up database before deploy
+        run: |
+          cd ~/app
+          docker compose exec -T db pg_dump \
+            -U ${{ secrets.POSTGRES_USER }} \
+            ${{ secrets.POSTGRES_DB }} \
+            > ~/app/backups/pre-deploy-$(date +%F_%H-%M).sql
+
+      - name: Pull latest image and run migrations
+        run: |
+          cd ~/app
+          echo "${{ secrets.GITHUB_TOKEN }}" | \
+            docker login ghcr.io -u ${{ github.actor }} --password-stdin
+          docker compose pull
+          docker compose run -T --rm web ./bin/rails db:prepare
+
+      - name: Redeploy services
+        run: |
+          cd ~/app
+          docker compose up -d
+
+      - name: Prune old Docker images
+        run: docker image prune -f
 
   deploy_demo:
     name: Deploy alpha to Render demo
@@ -354,11 +386,6 @@ jobs:
       update_gh_pages: true
     secrets: inherit
 
-  mobile:
-    name: Build Mobile Apps
-    if: startsWith(github.ref, 'refs/tags/v')
-    uses: ./.github/workflows/flutter-build.yml
-    secrets: inherit
 
   desktop:
     name: Build macOS Desktop App
@@ -369,7 +396,7 @@ jobs:
   release:
     name: Create GitHub Release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [merge, mobile, desktop, helm]
+    needs: [merge, desktop, helm]
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -464,15 +491,6 @@ jobs:
           generate_release_notes: true
           files: |
             ${{ runner.temp }}/release-assets/*
-          body: |
-            ## Mobile Debug Builds
-
-            This release includes debug builds of the mobile applications.  Download from the `Assets` area below.
-
-            - **Android APK**: Debug build for testing on Android devices
-            - **iOS Build**: Unsigned iOS build (requires code signing for installation)
-
-            > **Note**: These are debug builds intended for testing purposes. For production use, please build from source with proper signing credentials.
 
 
   create_release_branch:
