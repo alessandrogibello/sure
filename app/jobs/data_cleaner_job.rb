@@ -5,6 +5,7 @@ class DataCleanerJob < ApplicationJob
     clean_old_merchant_associations
     clean_expired_archived_exports
     clean_stale_enable_banking_psu_ips
+    EnablefinancePendingUpdateJob.perform_now
   end
 
   private
