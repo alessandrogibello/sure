@@ -1,0 +1,51 @@
+name: Sync Upstream Alpha Release
+
+on:
+  schedule:
+    - cron: '0 4 * * *' # Every day at 04:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream and check for latest alpha release
+        id: check_release
+        run: |
+          git remote add upstream https://github.com/we-promise/sure.git || true
+          git fetch upstream --tags
+
+          # Find the newest upstream tag matching *-alpha.*
+          LATEST_ALPHA=$(git tag -l "*-alpha.*" --sort=-v:refname | head -n 1)
+          echo "Latest upstream alpha tag: $LATEST_ALPHA"
+
+          if git merge-base --is-ancestor "$LATEST_ALPHA" HEAD; then
+            echo "Already up-to-date with $LATEST_ALPHA."
+            echo "needs_sync=false" >> $GITHUB_OUTPUT
+          else
+            echo "New alpha release found: $LATEST_ALPHA"
+            echo "needs_sync=true" >> $GITHUB_OUTPUT
+            echo "tag=$LATEST_ALPHA" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Merge latest alpha release into main
+        if: steps.check_release.outputs.needs_sync == 'true'
+        run: |
+          TAG="${{ steps.check_release.outputs.tag }}"
+          echo "Merging $TAG into main..."
+          git merge "$TAG" -m "chore(release): sync upstream release $TAG"
+          git push origin main
