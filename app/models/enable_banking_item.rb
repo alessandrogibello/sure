@@ -236,6 +236,34 @@ class EnableBankingItem < ApplicationRecord
     results
   end
 
+  # Confirms stale pending Enable Banking transactions across all linked accounts.
+  # Called by EnablefinancePendingUpdateJob (via DataCleanerJob) daily.
+  #
+  # A "stale pending" transaction is one whose Enable Banking pending flag has not
+  # been cleared after PENDING_CONFIRMATION_DAYS (default: 2 days). This handles the
+  # case where a bank (e.g. Revolut) settles a pending transaction silently without
+  # re-emitting it in the BOOK feed.
+  #
+  # @return [Hash] { total_confirmed: Integer, accounts_processed: Integer }
+  def confirm_stale_pending_transactions!(threshold_days: EnableBankingAccount::PendingConfirmation::PENDING_CONFIRMATION_DAYS)
+    total_confirmed = 0
+    accounts_processed = 0
+
+    enable_banking_accounts.joins(:account).merge(Account.visible).each do |eb_account|
+      begin
+        confirmed = eb_account.confirm_stale_pending_transactions!(threshold_days: threshold_days)
+        total_confirmed += confirmed
+        accounts_processed += 1
+      rescue => e
+        Rails.logger.error "EnableBankingItem #{id} - Failed to confirm stale pending for account #{eb_account.id}: #{e.message}"
+      end
+    end
+
+    Rails.logger.info "EnableBankingItem #{id} - Confirmed #{total_confirmed} stale pending transaction(s) across #{accounts_processed} account(s)" if total_confirmed > 0
+
+    { total_confirmed: total_confirmed, accounts_processed: accounts_processed }
+  end
+
   def schedule_account_syncs(parent_sync: nil, window_start_date: nil, window_end_date: nil)
     return [] if accounts.empty?
 

@@ -479,6 +479,7 @@ class EnableBankingItem::Importer
       end
 
       pending_transactions = []
+      current_pdng_ids = Set.new
       if include_pending
         # Also fetch pending transactions (visible for 1-3 days before they become BOOK) if setting is enabled.
         # The BOOK fetch above used the same date_from/date_to and succeeded, so any 422 raised here is
@@ -564,6 +565,11 @@ class EnableBankingItem::Importer
 
         book_entry_refs = booked_transactions_for_settlement
           .map { |tx| tx.with_indifferent_access[:entry_reference].presence }
+          .compact.to_set
+
+        book_ids = all_transactions
+          .reject { |tx| tx.with_indifferent_access[:_pending] }
+          .map { |tx| tx.with_indifferent_access[:transaction_id].presence }
           .compact.to_set
 
         if include_pending
@@ -798,6 +804,90 @@ class EnableBankingItem::Importer
         next unless eb_acc
         # Update the API account_id (UUID) if it has changed (UIDs are session-scoped)
         eb_acc.update!(account_id: current_uid) if eb_acc.account_id != current_uid
+      end
+    end
+
+    # Detect stored pending entries that vanished from the PDNG feed without
+    # appearing in BOOK. Those transactions were silently settled by the bank.
+    # Removes the _pending flag from the stored hash and clears the DB-side
+    # extra["enable_banking"]["pending"] on the corresponding Transaction record.
+    #
+    # @return [Boolean] true if any entries were confirmed
+    def confirm_silently_settled_pending(enable_banking_account, existing_transactions, current_pdng_ids:, current_book_ids:, current_book_entry_refs:)
+      return false unless enable_banking_account.current_account.present?
+
+      confirmed_external_ids = []
+
+      existing_transactions.each do |tx|
+        tx_h = tx.with_indifferent_access
+        pending_flag = tx_h.dig(:extra, :enable_banking, :pending) || tx_h[:_pending]
+        next unless pending_flag
+
+        tx_id      = tx_h[:transaction_id].presence
+        entry_ref  = tx_h[:entry_reference].presence
+        lookup_id  = tx_id || entry_ref
+        next if lookup_id.blank?
+
+        # Still in current PDNG feed → genuinely pending, skip
+        next if current_pdng_ids.include?(lookup_id)
+
+        # Appeared in current BOOK feed → C4 already handles removal, skip
+        next if tx_id.present?    && current_book_ids.include?(tx_id)
+        next if entry_ref.present? && current_book_entry_refs.include?(entry_ref)
+
+        # Silently settled — strip pending flag from stored hash.
+        # Keys may be strings (JSONB round-trip) or symbols (in-memory merge).
+        tx.delete("_pending")
+        tx.delete(:_pending)
+        [ "extra", :extra ].each do |ekey|
+          next unless tx[ekey].is_a?(Hash)
+          [ "enable_banking", :enable_banking ].each do |ebkey|
+            next unless tx[ekey][ebkey].is_a?(Hash)
+            tx[ekey][ebkey].delete("pending")
+            tx[ekey][ebkey].delete(:pending)
+            tx[ekey].delete(ebkey) if tx[ekey][ebkey].empty?
+          end
+        end
+
+        confirmed_external_ids << "enable_banking_#{lookup_id}"
+      end
+
+      if confirmed_external_ids.any?
+        confirm_db_pending_entries(enable_banking_account, confirmed_external_ids)
+        Rails.logger.info(
+          "EnableBankingItem::Importer - C5: Confirmed #{confirmed_external_ids.size} silently " \
+          "settled pending transaction(s) for account #{enable_banking_account.uid}"
+        )
+      end
+
+      confirmed_external_ids.any?
+    end
+
+    # Clear the pending flag on persisted Transaction records that were
+    # confirmed as silently settled (C5). Uses update_columns to skip
+    # callbacks — this is a surgical cleanup, not a user-driven edit.
+    def confirm_db_pending_entries(enable_banking_account, external_ids)
+      return if external_ids.empty?
+
+      account = enable_banking_account.current_account
+      return unless account
+
+      entries = account.entries
+        .joins("INNER JOIN transactions ON transactions.id = entries.entryable_id AND entries.entryable_type = 'Transaction'")
+        .where(external_id: external_ids, source: "enable_banking")
+        .where("(transactions.extra -> 'enable_banking' ->> 'pending')::boolean = true")
+
+      entries.each do |entry|
+        transaction = entry.entryable
+        next unless transaction.is_a?(Transaction)
+
+        updated_extra = (transaction.extra || {}).deep_dup
+        eb_extra = updated_extra["enable_banking"] || {}
+        eb_extra.delete("pending")
+        updated_extra["enable_banking"] = eb_extra
+        updated_extra.delete("enable_banking") if eb_extra.empty?
+
+        transaction.update_columns(extra: updated_extra)
       end
     end
 
